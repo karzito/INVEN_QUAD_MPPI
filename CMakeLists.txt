@@ -8,6 +8,8 @@ project(quad_mppi)
 ## if COMPONENTS list like find_package(catkin REQUIRED COMPONENTS xyz)
 ## is used, also find other catkin packages
 find_package(catkin REQUIRED COMPONENTS
+	mavros
+	mavros_msgs
   geometry_msgs
   nav_msgs
   octomap_msgs
@@ -141,6 +143,11 @@ target_link_libraries(quad_mppi_node
   octomap
   octomath
   Eigen3::Eigen
+)
+
+add_executable(my_quad_node src/my_quad_node.cpp)
+target_link_libraries(my_quad_node
+  ${catkin_LIBRARIES}
 )
 
 ## Declare a C++ library
