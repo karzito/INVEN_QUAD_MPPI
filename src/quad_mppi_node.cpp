@@ -190,18 +190,14 @@ public:
             for (size_t i = 0; i < point_idx_radius_search.size(); ++i) {
                 double distance_to_obstacle_sq = point_radius_squared_distance[i];
 
-                if (distance_to_obstacle_sq < 1e-6) {
-                    distance_to_obstacle_sq = 1e-6;  // Prevent division by very small values
-                }
-
-                // If the distance is less than the safe distance, compute the obstacle cost
+                // If the distance is less than the safe distance, return 1
                 if (distance_to_obstacle_sq < safe_dist_sq) {
-                    obstacle_cost += std::exp(safe_dist_sq / distance_to_obstacle_sq);
+                    return 1.0;
                 }
             }
         }
 
-        return obstacle_cost;
+        return 0.0;
     }
 
     double compute_control_cost(const Control3D& controls) {
