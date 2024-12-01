@@ -15,7 +15,6 @@
 #include <mavros_msgs/State.h>
 #include <mavros_msgs/RCOut.h>
 
-
 mavros_msgs::State current_state;
 void state_cb(const mavros_msgs::State::ConstPtr& msg) {
     current_state = *msg;
@@ -26,11 +25,11 @@ void rcOut_cb(const mavros_msgs::RCOut::ConstPtr& msg) {
     current_pwm = *msg;
 }
 
-geometry_msgs::Twist current_cmd_vel;
-bool cmd_vel_received = false;
-void cmd_vel_cb(const geometry_msgs::Twist::ConstPtr& msg) {
-    current_cmd_vel = *msg;
-    cmd_vel_received = true;
+mavros_msgs::AttitudeTarget received_cmd;
+bool is_cmd_received = false;
+void control_cmd_cb(const mavros_msgs::AttitudeTarget::ConstPtr& msg) {
+    received_cmd = *msg;
+    is_cmd_received = true;
 }
 
 int main(int argc, char **argv) {
@@ -47,8 +46,8 @@ int main(int argc, char **argv) {
             ("mavros/state", 10, state_cb);
     ros::Publisher attitude_target_pub = nh.advertise<mavros_msgs::AttitudeTarget>
             ("mavros/setpoint_raw/attitude", 10);
-    ros::Subscriber cmd_vel_sub = nh.subscribe<geometry_msgs::Twist>
-            ("/cmd_vel", 10, cmd_vel_cb);
+    ros::Subscriber control_cmd_sub = nh.subscribe<mavros_msgs::AttitudeTarget>
+            ("/control_cmd", 10, control_cmd_cb);
     ros::Publisher pos_pub = nh.advertise<geometry_msgs::PoseStamped>
             ("mavros/setpoint_position/local", 10);
     ros::Publisher vel_pub = nh.advertise<geometry_msgs::TwistStamped>
@@ -59,7 +58,7 @@ int main(int argc, char **argv) {
             ("mavros/set_mode");
 
     //the setpoint publishing rate MUST be faster than 2Hz
-    ros::Rate rate(100.0);
+    ros::Rate rate(20.0);
 
     // wait for FCU connection
     while(ros::ok() && !current_state.connected) {
@@ -77,6 +76,13 @@ int main(int argc, char **argv) {
     pos_cmd_stamped.pose.position.x = 0.0;
     pos_cmd_stamped.pose.position.y = 0.0;
     pos_cmd_stamped.pose.position.z = 2.0;
+
+    mavros_msgs::AttitudeTarget att_cmd;
+    att_cmd.type_mask = mavros_msgs::AttitudeTarget::IGNORE_ATTITUDE;
+    att_cmd.body_rate.x = 0.0;
+    att_cmd.body_rate.y = 0.0;
+    att_cmd.body_rate.z = 0.0;
+    att_cmd.thrust = 0.6;
 
     geometry_msgs::TwistStamped vel_cmd_stamped;
     vel_cmd_stamped.twist.linear.x = 0;
@@ -104,19 +110,21 @@ int main(int argc, char **argv) {
             }
         }
 
-        if ( current_state.armed && cmd_vel_received && (ros::Time::now() - last_request > ros::Duration(10.0)) ) {
+        if ( current_state.armed && is_cmd_received && (ros::Time::now() - last_request > ros::Duration(10.0)) ) {
             if (!tracking_flag) {
                 ROS_INFO("MPPI Control Start!");
                 tracking_flag = true;
             }
             else {
-                // Update velocity command based on received command from quad_mppi_node
-                vel_cmd_stamped.header.stamp = ros::Time::now();
-                vel_cmd_stamped.twist = current_cmd_vel;
+                // Update command based on received command from quad_mppi_node
+                att_cmd.body_rate.x = received_cmd.body_rate.x;
+                att_cmd.body_rate.y = received_cmd.body_rate.y;
+                att_cmd.body_rate.z = received_cmd.body_rate.z;
+                att_cmd.thrust = received_cmd.thrust;
             }
         }
 
-        if (tracking_flag) vel_pub.publish(vel_cmd_stamped);
+        if (tracking_flag) attitude_target_pub.publish(att_cmd);
         else pos_pub.publish(pos_cmd_stamped);
 
         ros::spinOnce();

@@ -10,14 +10,15 @@ project(quad_mppi)
 find_package(catkin REQUIRED COMPONENTS
 	mavros
 	mavros_msgs
-  geometry_msgs
-  nav_msgs
-  octomap_msgs
-  roscpp
-  std_msgs
-  visualization_msgs
-  pcl_ros
-  pcl_conversions
+  	geometry_msgs
+  	nav_msgs
+  	octomap_msgs
+  	roscpp
+  	std_msgs
+  	visualization_msgs
+  	pcl_ros
+  	pcl_conversions
+	sensor_msgs
 )
 
 find_package(PCL REQUIRED)
