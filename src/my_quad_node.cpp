@@ -58,7 +58,7 @@ int main(int argc, char **argv) {
             ("mavros/set_mode");
 
     //the setpoint publishing rate MUST be faster than 2Hz
-    ros::Rate rate(20.0);
+    ros::Rate rate(100);
 
     // wait for FCU connection
     while(ros::ok() && !current_state.connected) {
@@ -78,11 +78,12 @@ int main(int argc, char **argv) {
     pos_cmd_stamped.pose.position.z = 2.0;
 
     mavros_msgs::AttitudeTarget att_cmd;
-    att_cmd.type_mask = mavros_msgs::AttitudeTarget::IGNORE_ATTITUDE;
-    att_cmd.body_rate.x = 0.0;
-    att_cmd.body_rate.y = 0.0;
-    att_cmd.body_rate.z = 0.0;
-    att_cmd.thrust = 0.6;
+    att_cmd.type_mask = mavros_msgs::AttitudeTarget::IGNORE_ROLL_RATE | mavros_msgs::AttitudeTarget::IGNORE_PITCH_RATE | mavros_msgs::AttitudeTarget::IGNORE_YAW_RATE;
+    att_cmd.orientation.w = 1.0;
+    att_cmd.orientation.x = 0.0;
+    att_cmd.orientation.y = 0.0;
+    att_cmd.orientation.z = 0.0;
+    att_cmd.thrust = 0.0;
 
     geometry_msgs::TwistStamped vel_cmd_stamped;
     vel_cmd_stamped.twist.linear.x = 0;
@@ -117,9 +118,9 @@ int main(int argc, char **argv) {
             }
             else {
                 // Update command based on received command from quad_mppi_node
-                att_cmd.body_rate.x = received_cmd.body_rate.x;
-                att_cmd.body_rate.y = received_cmd.body_rate.y;
-                att_cmd.body_rate.z = received_cmd.body_rate.z;
+                att_cmd.orientation.x = received_cmd.orientation.x;
+                att_cmd.orientation.y = received_cmd.orientation.y;
+                att_cmd.orientation.z = received_cmd.orientation.z;
                 att_cmd.thrust = received_cmd.thrust;
             }
         }

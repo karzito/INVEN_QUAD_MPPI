@@ -26,7 +26,8 @@
 #include <Eigen/Dense> 
 #include <pcl/kdtree/kdtree_flann.h>
 
-#define MAX_THRUST (double)((109 * 10) * (109 * 10) * 5.84e-06)
+
+#define MAX_THRUST (double)(((109 * 10) * (109 * 10) * 5.84e-06) * 4.0)
 
 namespace MPPI {
     const int K = 300;                  // Number of samples
@@ -297,7 +298,7 @@ class MPPIController {
             if (valid_obstacle) {
                 kdtree.setInputCloud(obstacles);
             } else {
-                ROS_INFO("[MPPI] Point cloud is empty. No obstacles detected.");
+                // ROS_INFO("[MPPI] Point cloud is empty. No obstacles detected.");
             }
 
             // Containers for storing control updates and costs
@@ -801,7 +802,7 @@ int main(int argc, char** argv) {
     QuadStatesScriber quad_states_subscriber(nh);
 
     // Wait for quadrotor state data to be available
-    ros::Rate rate(100);  // 100 Hz
+    ros::Rate rate(10);  // 100 Hz
     while (ros::ok() && !quad_states_subscriber.isDataAvailable()) {
         ros::spinOnce();  // Process incoming messages
         rate.sleep();
@@ -831,8 +832,6 @@ int main(int argc, char** argv) {
     std::vector<Controls> control_sequence(MPPI::N, {QuadParams::mass*QuadParams::gravConst, 0.0, 0.0, 0.0});
 
     while (ros::ok()) {
-        // Start timing
-        ros::Time start_time = ros::Time::now();
 
         // current states receive
         quad_current_states = quad_states_subscriber.getQuadStates();
@@ -854,24 +853,18 @@ int main(int argc, char** argv) {
         mavros_msgs::AttitudeTarget cmd;
 
         // Update state based on noisy control
-        cmd.body_rate.x = optimal_states[1].twist.twist.angular.x;
-        cmd.body_rate.y = optimal_states[1].twist.twist.angular.y;   
-        cmd.body_rate.z = optimal_states[1].twist.twist.angular.z;
+        cmd.orientation.w = optimal_states[1].pose.pose.orientation.w;
+        cmd.orientation.x = optimal_states[1].pose.pose.orientation.x;
+        cmd.orientation.y = optimal_states[1].pose.pose.orientation.y;   
+        cmd.orientation.z = optimal_states[1].pose.pose.orientation.z;
         cmd.thrust = std::min(control_sequence[0].ct / MAX_THRUST, 1.0);
         control_publisher.controlPublish(cmd);
-        // ROS_INFO("%f, %f, %f, %f", optimal_states[MPPI::N-1].pose.pose.orientation.w, optimal_states[MPPI::N-1].pose.pose.orientation.x, optimal_states[MPPI::N-1].pose.pose.orientation.y, optimal_states[MPPI::N-1].pose.pose.orientation.z);
-
-        // End timing
-        ros::Time end_time = ros::Time::now();
-        ros::Duration elapsed_time = end_time - start_time;
-
-        // Print the total elapsed time for the iteration
-        ROS_INFO("Total computation time for this iteration: %f seconds", elapsed_time.toSec());
+        ROS_INFO("Controls: thrust:%f, quaternions: %f, %f, %f, %f", cmd.thrust, cmd.orientation.w, cmd.orientation.x, cmd.orientation.y, cmd.orientation.z);
 
         // Shift the control sequence and reinitialize the last one
-        // for (int i = 0; i < MPPI::N - 1; ++i) {
-        //     control_sequence[i] = control_sequence[i + 1];
-        // }
+        for (int i = 0; i < MPPI::N - 1; ++i) {
+            control_sequence[i] = control_sequence[i + 1];
+        }
 
         ros::spinOnce();
         rate.sleep();
