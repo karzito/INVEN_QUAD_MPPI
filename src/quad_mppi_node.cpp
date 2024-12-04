@@ -23,11 +23,15 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <Eigen/Dense> 
 #include <pcl/kdtree/kdtree_flann.h>
+#include <chrono>
+#include <iostream>
+
+#include "noise_generator_cuda.h"
 
 namespace MPPI {
     const int K = 300;                  // Number of samples
-    const int N = 20;                   // Prediction horizon
-    const double dt = 0.1;               // Sampling time
+    const int N = 50;                   // Prediction horizon
+    const double dt = 0.02;               // Sampling time
     const double lambda =1e-6;           // Temperature for cost weighting
     const double control_noise = 0.75;    // Noise level for control samples
     const double H_inv_G = 1.0;         // Simplification;
@@ -45,390 +49,515 @@ struct Control3D {
 };
 
 class MPPIController {
-public:
-    MPPIController(ros::NodeHandle nh, const geometry_msgs::PoseStamped& start_point, const geometry_msgs::PoseStamped& goal_point)
-        : nh(nh), start_point(start_point), goal_point(goal_point) 
-    {
-        trajectory_marker_pub = nh.advertise<visualization_msgs::Marker>("trajectory_marker", 10);
-        selected_marker_pub = nh.advertise<visualization_msgs::Marker>("selected_marker", 10);
+    public:
+        MPPIController(ros::NodeHandle nh, const geometry_msgs::PoseStamped& start_point, const geometry_msgs::PoseStamped& goal_point)
+            : nh(nh), start_point(start_point), goal_point(goal_point) 
+        {
+            trajectory_marker_pub = nh.advertise<visualization_msgs::Marker>("trajectory_marker", 10);
+            selected_marker_pub = nh.advertise<visualization_msgs::Marker>("selected_marker", 10);
 
-        // Proper initialization inside the constructor
-        sampled_position.resize(MPPI::K);
-        for (int i = 0; i < MPPI::K; ++i) {
-            sampled_position[i].resize(MPPI::N);
-        }
-        selected_position.resize(MPPI::N);
+            // Proper initialization inside the constructor
+            sampled_position.resize(MPPI::K);
+            for (int i = 0; i < MPPI::K; ++i) {
+                sampled_position[i].resize(MPPI::N);
+            }
+            selected_position.resize(MPPI::N);
 
-        ROS_INFO("[MPPI] MPPI control class has been successfully created!");
-    }
-
-    double compute_cost(const nav_msgs::Odometry& states, Control3D& controls, pcl::KdTreeFLANN<pcl::PointXYZ>& kdtree) {
-        double cost = 0.0;
-
-        double dist_to_goal_cost = compute_dist_to_goal_cost(states);
-        double direction_cost = compute_direction_cost(states);
-        double obstacle_cost = compute_obstacle_cost(states, kdtree);
-        double control_cost = compute_control_cost(controls);
-
-        cost = (MPPI::dist_to_goal_weight * dist_to_goal_cost) + (MPPI::direction_weight * direction_cost) + (MPPI::obs_weight * obstacle_cost) + (MPPI::control_weight * control_cost);
-
-        return cost;
-    }
-
-    double compute_cost(const nav_msgs::Odometry& states, Control3D& controls) {
-        double cost = 0.0;
-
-        double dist_to_goal_cost = compute_dist_to_goal_cost(states);
-        double direction_cost = compute_direction_cost(states);
-        double control_cost = compute_control_cost(controls);
-
-        cost = (MPPI::dist_to_goal_weight * dist_to_goal_cost) + (MPPI::direction_weight * direction_cost) + (MPPI::control_weight * control_cost);
-
-        return cost;
-    }
-
-    double compute_dist_to_goal_cost(const nav_msgs::Odometry& states) {
-        double px = states.pose.pose.position.x;
-        double py = states.pose.pose.position.y;
-        double pz = states.pose.pose.position.z;
-
-        double xg = goal_point.pose.position.x;
-        double yg = goal_point.pose.position.y;
-        double zg = goal_point.pose.position.z;
-
-        double dist = std::pow(px - xg, 2) + std::pow(py - yg, 2) + std::pow(pz - zg, 2);
-        return dist;
-    }
-
-
-    double compute_dist_to_global_path_cost(const nav_msgs::Odometry& states) {
-
-        // Use the same distance computation logic as previously discussed.
-        double px = states.pose.pose.position.x;
-        double py = states.pose.pose.position.y;
-        double pz = states.pose.pose.position.z;
-
-        double xs = start_point.pose.position.x;
-        double ys = start_point.pose.position.y;
-        double zs = start_point.pose.position.z;
-        double xg = goal_point.pose.position.x;
-        double yg = goal_point.pose.position.y;
-        double zg = goal_point.pose.position.z;
-
-        double dx = xg - xs;
-        double dy = yg - ys;
-        double dz = zg - zs;
-
-        double projLen = ((px - xs) * dx + (py - ys) * dy + (pz - zs) * dz) / (dx * dx + dy * dy + dz * dz);
-
-        // If projLen is negative, give a large penalty (trajectory is going in the opposite direction)
-        if (projLen < 0) {
-            return 1e100;  // Super large penalty
+            ROS_INFO("[MPPI] MPPI control class has been successfully created!");
         }
 
-        double xc = xs + projLen * dx;
-        double yc = ys + projLen * dy;
-        double zc = zs + projLen * dz;
+        double compute_cost(const nav_msgs::Odometry& states, Control3D& controls, pcl::KdTreeFLANN<pcl::PointXYZ>& kdtree) {
+            double cost = 0.0;
 
-        double dist = std::sqrt(std::pow(px - xc, 2) + std::pow(py - yc, 2) + std::pow(pz - zc, 2));
-        return dist;
-    }
+            double dist_to_goal_cost = compute_dist_to_goal_cost(states);
+            double direction_cost = compute_direction_cost(states);
+            double obstacle_cost = compute_obstacle_cost(states, kdtree);
+            double control_cost = compute_control_cost(controls);
 
-    double compute_direction_cost(const nav_msgs::Odometry& states) {
-        // Vector from current position to goal
-        double dx = goal_point.pose.position.x - states.pose.pose.position.x;
-        double dy = goal_point.pose.position.y - states.pose.pose.position.y;
-        double dz = goal_point.pose.position.z - states.pose.pose.position.z;
+            cost = (MPPI::dist_to_goal_weight * dist_to_goal_cost) + (MPPI::direction_weight * direction_cost) + (MPPI::obs_weight * obstacle_cost) + (MPPI::control_weight * control_cost);
 
-        double norm = std::sqrt(dx * dx + dy * dy + dz * dz);
-        if (norm < 1e-6) return 0.0;
+            return cost;
+        }
 
-        // Normalize direction vector to goal
-        dx /= norm;
-        dy /= norm;
-        dz /= norm;
+        double compute_cost(const nav_msgs::Odometry& states, Control3D& controls) {
+            double cost = 0.0;
 
-        // Current velocity vector
-        double vx = states.twist.twist.linear.x;
-        double vy = states.twist.twist.linear.y;
-        double vz = states.twist.twist.linear.z;
+            double dist_to_goal_cost = compute_dist_to_goal_cost(states);
+            double direction_cost = compute_direction_cost(states);
+            double control_cost = compute_control_cost(controls);
 
-        double velocity_magnitude = std::sqrt(vx * vx + vy * vy + vz * vz);
-        if (velocity_magnitude < 1e-6) return 0.0;
+            cost = (MPPI::dist_to_goal_weight * dist_to_goal_cost) + (MPPI::direction_weight * direction_cost) + (MPPI::control_weight * control_cost);
 
-        // Normalize velocity vector
-        vx /= velocity_magnitude;
-        vy /= velocity_magnitude;
-        vz /= velocity_magnitude;
+            return cost;
+        }
 
-        // Compute cost as the negative of the dot product
-        // Higher cost when the drone is not moving towards the goal
-        double direction_cost = 1.0 - (dx * vx + dy * vy + dz * vz);
-        return direction_cost;
-    }
+        double compute_dist_to_goal_cost(const nav_msgs::Odometry& states) {
+            double px = states.pose.pose.position.x;
+            double py = states.pose.pose.position.y;
+            double pz = states.pose.pose.position.z;
 
-    double compute_obstacle_cost(const nav_msgs::Odometry& states, pcl::KdTreeFLANN<pcl::PointXYZ>& kdtree) {
-        double obstacle_cost = 0.0;
-        double max_check_radius = MPPI::safe_distance_to_obs;
+            double xg = goal_point.pose.position.x;
+            double yg = goal_point.pose.position.y;
+            double zg = goal_point.pose.position.z;
 
-        double px = states.pose.pose.position.x;
-        double py = states.pose.pose.position.y;
-        double pz = states.pose.pose.position.z;
+            double dist = std::pow(px - xg, 2) + std::pow(py - yg, 2) + std::pow(pz - zg, 2);
+            return dist;
+        }
 
-        pcl::PointXYZ search_point;
-        search_point.x = px;
-        search_point.y = py;
-        search_point.z = pz;
 
-        std::vector<int> point_idx_radius_search;
-        std::vector<float> point_radius_squared_distance;
+        double compute_dist_to_global_path_cost(const nav_msgs::Odometry& states) {
 
-        double safe_dist_sq = MPPI::safe_distance_to_obs * MPPI::safe_distance_to_obs;
+            // Use the same distance computation logic as previously discussed.
+            double px = states.pose.pose.position.x;
+            double py = states.pose.pose.position.y;
+            double pz = states.pose.pose.position.z;
 
-        // Perform nearest radius search
-        if (kdtree.radiusSearch(search_point, max_check_radius, point_idx_radius_search, point_radius_squared_distance) > 0) {
-            for (size_t i = 0; i < point_idx_radius_search.size(); ++i) {
-                double distance_to_obstacle_sq = point_radius_squared_distance[i];
+            double xs = start_point.pose.position.x;
+            double ys = start_point.pose.position.y;
+            double zs = start_point.pose.position.z;
+            double xg = goal_point.pose.position.x;
+            double yg = goal_point.pose.position.y;
+            double zg = goal_point.pose.position.z;
 
-                // If the distance is less than the safe distance, return 1
-                if (distance_to_obstacle_sq < safe_dist_sq) {
-                    return 1.0;
+            double dx = xg - xs;
+            double dy = yg - ys;
+            double dz = zg - zs;
+
+            double projLen = ((px - xs) * dx + (py - ys) * dy + (pz - zs) * dz) / (dx * dx + dy * dy + dz * dz);
+
+            // If projLen is negative, give a large penalty (trajectory is going in the opposite direction)
+            if (projLen < 0) {
+                return 1e100;  // Super large penalty
+            }
+
+            double xc = xs + projLen * dx;
+            double yc = ys + projLen * dy;
+            double zc = zs + projLen * dz;
+
+            double dist = std::sqrt(std::pow(px - xc, 2) + std::pow(py - yc, 2) + std::pow(pz - zc, 2));
+            return dist;
+        }
+
+        double compute_direction_cost(const nav_msgs::Odometry& states) {
+            // Vector from current position to goal
+            double dx = goal_point.pose.position.x - states.pose.pose.position.x;
+            double dy = goal_point.pose.position.y - states.pose.pose.position.y;
+            double dz = goal_point.pose.position.z - states.pose.pose.position.z;
+
+            double norm = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (norm < 1e-6) return 0.0;
+
+            // Normalize direction vector to goal
+            dx /= norm;
+            dy /= norm;
+            dz /= norm;
+
+            // Current velocity vector
+            double vx = states.twist.twist.linear.x;
+            double vy = states.twist.twist.linear.y;
+            double vz = states.twist.twist.linear.z;
+
+            double velocity_magnitude = std::sqrt(vx * vx + vy * vy + vz * vz);
+            if (velocity_magnitude < 1e-6) return 0.0;
+
+            // Normalize velocity vector
+            vx /= velocity_magnitude;
+            vy /= velocity_magnitude;
+            vz /= velocity_magnitude;
+
+            // Compute cost as the negative of the dot product
+            // Higher cost when the drone is not moving towards the goal
+            double direction_cost = 1.0 - (dx * vx + dy * vy + dz * vz);
+            return direction_cost;
+        }
+
+        double compute_obstacle_cost(const nav_msgs::Odometry& states, pcl::KdTreeFLANN<pcl::PointXYZ>& kdtree) {
+            double obstacle_cost = 0.0;
+            double max_check_radius = MPPI::safe_distance_to_obs;
+
+            double px = states.pose.pose.position.x;
+            double py = states.pose.pose.position.y;
+            double pz = states.pose.pose.position.z;
+
+            pcl::PointXYZ search_point;
+            search_point.x = px;
+            search_point.y = py;
+            search_point.z = pz;
+
+            std::vector<int> point_idx_radius_search;
+            std::vector<float> point_radius_squared_distance;
+
+            double safe_dist_sq = MPPI::safe_distance_to_obs * MPPI::safe_distance_to_obs;
+
+            // Perform nearest radius search
+            if (kdtree.radiusSearch(search_point, max_check_radius, point_idx_radius_search, point_radius_squared_distance) > 0) {
+                for (size_t i = 0; i < point_idx_radius_search.size(); ++i) {
+                    double distance_to_obstacle_sq = point_radius_squared_distance[i];
+
+                    // If the distance is less than the safe distance, return 1
+                    if (distance_to_obstacle_sq < safe_dist_sq) {
+                        return 1.0;
+                    }
                 }
             }
+
+            return 0.0;
         }
 
-        return 0.0;
-    }
-
-    double compute_control_cost(const Control3D& controls) {
-        return std::pow(controls.ux, 2) + std::pow(controls.uy, 2) + std::pow(controls.uz, 2);
-    }
-
-    void mppi_optimization(const nav_msgs::Odometry& states, std::vector<Control3D>& control_sequence, const pcl::PointCloud<pcl::PointXYZ>::Ptr obstacles) {
-        // Set up the KD-tree for nearest neighbor search
-        pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
-
-        bool valid_obstacle = !obstacles->empty();
-        if (valid_obstacle) {
-            kdtree.setInputCloud(obstacles);
-        } else {
-            ROS_INFO("[MPPI] Point cloud is empty. No obstacles detected.");
+        double compute_control_cost(const Control3D& controls) {
+            return std::pow(controls.ux, 2) + std::pow(controls.uy, 2) + std::pow(controls.uz, 2);
         }
 
-        // Containers for storing control updates and costs
-        std::vector<Control3D> control_update(MPPI::N, {0.0, 0.0, 0.0});
-        std::vector<double> cost_weights(MPPI::K, 0.0);
-        std::vector<std::vector<Control3D>> noisy_controls(MPPI::K, std::vector<Control3D>(MPPI::N));
-        double dt_sqrt = std::sqrt(MPPI::dt);
+        void mppi_optimization(const nav_msgs::Odometry& states, std::vector<Control3D>& control_sequence, const pcl::PointCloud<pcl::PointXYZ>::Ptr obstacles) {
+            // Set up the KD-tree for nearest neighbor search
+            pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
 
-        // Loop through K samples
-        #pragma omp parallel for
-        for (int k = 0; k < MPPI::K; ++k) {
-            nav_msgs::Odometry sampled_states = states;
-            double total_cost = 0.0;
+            bool valid_obstacle = !obstacles->empty();
+            if (valid_obstacle) {
+                kdtree.setInputCloud(obstacles);
+            } else {
+                ROS_INFO("[MPPI] Point cloud is empty. No obstacles detected.");
+            }
 
-            // Generate a noisy trajectory and accumulate cost
+            // Containers for storing control updates and costs
+            std::vector<Control3D> control_update(MPPI::N, {0.0, 0.0, 0.0});
+            std::vector<double> cost_weights(MPPI::K, 0.0);
+            std::vector<std::vector<Control3D>> noisy_controls(MPPI::K, std::vector<Control3D>(MPPI::N));
+            double dt_sqrt = std::sqrt(MPPI::dt);
+
+            // Generate noise using CUDA
+            std::vector<double> noise_values(MPPI::K * MPPI::N * 3);
+            generateNoiseCUDA(noise_values, 0.0, MPPI::control_noise);
+            for (int k = 0; k < 10; k++) {
+                std::cout << noise_values[0] << ", " << noise_values[1] << ", " << noise_values[2] << std::endl;
+            }
+
+            int idx = 0;
+            for (int k = 0; k < MPPI::K; ++k) {
+                nav_msgs::Odometry sampled_states = states;
+                double total_cost = 0.0;
+
+                // Generate a noisy trajectory and accumulate cost
+                for (int i = 0; i < MPPI::N; ++i) {
+                    // noisy_controls[k][i].ux = control_sequence[i].ux + noise_distribution(noise_generator);
+                    // noisy_controls[k][i].uy = control_sequence[i].uy + noise_distribution(noise_generator);
+                    // noisy_controls[k][i].uz = control_sequence[i].uz + noise_distribution(noise_generator);
+                    noisy_controls[k][i].ux = control_sequence[i].ux + noise_values[idx++];
+                    noisy_controls[k][i].uy = control_sequence[i].uy + noise_values[idx++];
+                    noisy_controls[k][i].uz = control_sequence[i].uz + noise_values[idx++];
+
+                    double prev_pos_x = sampled_states.pose.pose.position.x;
+                    double prev_pos_y = sampled_states.pose.pose.position.y;
+                    double prev_pos_z = sampled_states.pose.pose.position.z;
+
+                    // Update state based on noisy control
+                    sampled_states.pose.pose.position.x += (noisy_controls[k][i].ux * MPPI::dt);
+                    sampled_states.pose.pose.position.y += (noisy_controls[k][i].uy * MPPI::dt);
+                    sampled_states.pose.pose.position.z += (noisy_controls[k][i].uz * MPPI::dt);
+
+                    sampled_states.twist.twist.linear.x = (sampled_states.pose.pose.position.x - prev_pos_x) / MPPI::dt;
+                    sampled_states.twist.twist.linear.y = (sampled_states.pose.pose.position.y - prev_pos_y) / MPPI::dt;
+                    sampled_states.twist.twist.linear.z = (sampled_states.pose.pose.position.z - prev_pos_z) / MPPI::dt;
+
+                    sampled_position[k][i].point.x = sampled_states.pose.pose.position.x;
+                    sampled_position[k][i].point.y = sampled_states.pose.pose.position.y;
+                    sampled_position[k][i].point.z = sampled_states.pose.pose.position.z;
+
+                    // Only compute obstacle cost if we have valid obstacles
+                    if (valid_obstacle) {
+                        total_cost += compute_cost(sampled_states, noisy_controls[k][i], kdtree);
+                    } else {
+                        // Skip obstacle cost, only compute goal-related costs
+                        total_cost += compute_cost(sampled_states, noisy_controls[k][i]);
+                    }
+                }
+
+                // Calculate the exponential weighting for this sample based on its total cost
+                cost_weights[k] = total_cost / MPPI::lambda;
+            }
+            double min_weight = *std::min_element(cost_weights.begin(), cost_weights.end());
+            for (int k = 0; k < MPPI::K; ++k) {
+                cost_weights[k] = std::exp(min_weight - cost_weights[k]);
+            }
+
+            // Normalize the cost weights for stability
+            double weight_sum = std::accumulate(cost_weights.begin(), cost_weights.end(), 0.0);
+            for (int k = 0; k < MPPI::K; ++k) {
+                cost_weights[k] /= weight_sum;
+            }
+
+            // Calculate weighted control update for each time step
             for (int i = 0; i < MPPI::N; ++i) {
-                noisy_controls[k][i].ux = control_sequence[i].ux + noise_distribution(noise_generator);
-                noisy_controls[k][i].uy = control_sequence[i].uy + noise_distribution(noise_generator);
-                noisy_controls[k][i].uz = control_sequence[i].uz + noise_distribution(noise_generator);
+                double ux_sum = 0.0;
+                double uy_sum = 0.0;
+                double uz_sum = 0.0;
 
-                double prev_pos_x = sampled_states.pose.pose.position.x;
-                double prev_pos_y = sampled_states.pose.pose.position.y;
-                double prev_pos_z = sampled_states.pose.pose.position.z;
+                for (int k = 0; k < MPPI::K; ++k) {
+                    // Scale the noise by the time step and temperature
+                    double noise_ux = (noisy_controls[k][i].ux - control_sequence[i].ux) * dt_sqrt;
+                    double noise_uy = (noisy_controls[k][i].uy - control_sequence[i].uy) * dt_sqrt;
+                    double noise_uz = (noisy_controls[k][i].uz - control_sequence[i].uz) * dt_sqrt;
 
-                // Update state based on noisy control
-                sampled_states.pose.pose.position.x += (noisy_controls[k][i].ux * MPPI::dt);
-                sampled_states.pose.pose.position.y += (noisy_controls[k][i].uy * MPPI::dt);
-                sampled_states.pose.pose.position.z += (noisy_controls[k][i].uz * MPPI::dt);
+                    // Accumulate the weighted control adjustments
+                    ux_sum += cost_weights[k] * noise_ux;
+                    uy_sum += cost_weights[k] * noise_uy;
+                    uz_sum += cost_weights[k] * noise_uz;
+                }
 
-                sampled_states.twist.twist.linear.x = (sampled_states.pose.pose.position.x - prev_pos_x) / MPPI::dt;
-                sampled_states.twist.twist.linear.y = (sampled_states.pose.pose.position.y - prev_pos_y) / MPPI::dt;
-                sampled_states.twist.twist.linear.z = (sampled_states.pose.pose.position.z - prev_pos_z) / MPPI::dt;
+                // Normalize and apply H_inv_G
+                if (weight_sum != 0.0) {
+                    control_update[i].ux = MPPI::H_inv_G * (ux_sum / weight_sum);
+                    control_update[i].uy = MPPI::H_inv_G * (uy_sum / weight_sum);
+                    control_update[i].uz = MPPI::H_inv_G * (uz_sum / weight_sum);
+                }
+                else {
+                    control_update[i].ux = 0.0;
+                    control_update[i].uy = 0.0;
+                    control_update[i].uz = 0.0;
+                }
+            }
 
-                sampled_position[k][i].point.x = sampled_states.pose.pose.position.x;
-                sampled_position[k][i].point.y = sampled_states.pose.pose.position.y;
-                sampled_position[k][i].point.z = sampled_states.pose.pose.position.z;
+            // Update control sequence incrementally
+            selected_position[0].point.x = states.pose.pose.position.x;
+            selected_position[0].point.y = states.pose.pose.position.y;
+            selected_position[0].point.z = states.pose.pose.position.z;
 
-                // Only compute obstacle cost if we have valid obstacles
-                if (valid_obstacle) {
-                    total_cost += compute_cost(sampled_states, noisy_controls[k][i], kdtree);
-                } else {
+            for (int i = 0; i < MPPI::N; ++i) {
+                control_sequence[i].ux += control_update[i].ux;
+                control_sequence[i].uy += control_update[i].uy;
+                control_sequence[i].uz += control_update[i].uz;
+
+                if (i > 0) {
+                    selected_position[i].point.x = selected_position[i-1].point.x + (control_sequence[i-1].ux * MPPI::dt);
+                    selected_position[i].point.y = selected_position[i-1].point.y + (control_sequence[i-1].uy * MPPI::dt);
+                    selected_position[i].point.z = selected_position[i-1].point.z + (control_sequence[i-1].uz * MPPI::dt);
+                }
+            }
+
+            sampled_position_publish();
+            selected_position_publish();
+        }
+
+        void mppi_optimization(const nav_msgs::Odometry& states, std::vector<Control3D>& control_sequence) {
+            // Set up the KD-tree for nearest neighbor search
+            // pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
+
+            // Containers for storing control updates and costs
+            std::vector<Control3D> control_update(MPPI::N, {0.0, 0.0, 0.0});
+            std::vector<double> cost_weights(MPPI::K, 0.0);
+            std::vector<std::vector<Control3D>> noisy_controls(MPPI::K, std::vector<Control3D>(MPPI::N));
+            double dt_sqrt = std::sqrt(MPPI::dt);
+
+            // Generate noise using CUDA
+            std::vector<double> noise_values(MPPI::K * MPPI::N * 3);
+            generateNoiseCUDA(noise_values, 0.0, MPPI::control_noise);
+
+            int idx = 0;
+            for (int k = 0; k < MPPI::K; ++k) {
+                nav_msgs::Odometry sampled_states = states;
+                double total_cost = 0.0;
+
+                // Generate a noisy trajectory and accumulate cost
+                for (int i = 0; i < MPPI::N; ++i) {
+                    // noisy_controls[k][i].ux = control_sequence[i].ux + noise_distribution(noise_generator);
+                    // noisy_controls[k][i].uy = control_sequence[i].uy + noise_distribution(noise_generator);
+                    // noisy_controls[k][i].uz = control_sequence[i].uz + noise_distribution(noise_generator);
+                    noisy_controls[k][i].ux = control_sequence[i].ux + noise_values[idx++];
+                    noisy_controls[k][i].uy = control_sequence[i].uy + noise_values[idx++];
+                    noisy_controls[k][i].uz = control_sequence[i].uz + noise_values[idx++];
+
+                    double prev_pos_x = sampled_states.pose.pose.position.x;
+                    double prev_pos_y = sampled_states.pose.pose.position.y;
+                    double prev_pos_z = sampled_states.pose.pose.position.z;
+
+                    // Update state based on noisy control
+                    sampled_states.pose.pose.position.x += (noisy_controls[k][i].ux * MPPI::dt);
+                    sampled_states.pose.pose.position.y += (noisy_controls[k][i].uy * MPPI::dt);
+                    sampled_states.pose.pose.position.z += (noisy_controls[k][i].uz * MPPI::dt);
+
+                    sampled_states.twist.twist.linear.x = (sampled_states.pose.pose.position.x - prev_pos_x) / MPPI::dt;
+                    sampled_states.twist.twist.linear.y = (sampled_states.pose.pose.position.y - prev_pos_y) / MPPI::dt;
+                    sampled_states.twist.twist.linear.z = (sampled_states.pose.pose.position.z - prev_pos_z) / MPPI::dt;
+
+                    sampled_position[k][i].point.x = sampled_states.pose.pose.position.x;
+                    sampled_position[k][i].point.y = sampled_states.pose.pose.position.y;
+                    sampled_position[k][i].point.z = sampled_states.pose.pose.position.z;
+
+
                     // Skip obstacle cost, only compute goal-related costs
                     total_cost += compute_cost(sampled_states, noisy_controls[k][i]);
                 }
+
+                // Calculate the exponential weighting for this sample based on its total cost
+                cost_weights[k] = total_cost / MPPI::lambda;
             }
-
-            // Calculate the exponential weighting for this sample based on its total cost
-            cost_weights[k] = total_cost / MPPI::lambda;
-        }
-        double min_weight = *std::min_element(cost_weights.begin(), cost_weights.end());
-        for (int k = 0; k < MPPI::K; ++k) {
-            cost_weights[k] = std::exp(min_weight - cost_weights[k]);
-        }
-
-        // Normalize the cost weights for stability
-        double weight_sum = std::accumulate(cost_weights.begin(), cost_weights.end(), 0.0);
-        for (int k = 0; k < MPPI::K; ++k) {
-            cost_weights[k] /= weight_sum;
-        }
-
-        // Calculate weighted control update for each time step
-        for (int i = 0; i < MPPI::N; ++i) {
-            double ux_sum = 0.0;
-            double uy_sum = 0.0;
-            double uz_sum = 0.0;
-
+            double min_weight = *std::min_element(cost_weights.begin(), cost_weights.end());
             for (int k = 0; k < MPPI::K; ++k) {
-                // Scale the noise by the time step and temperature
-                double noise_ux = (noisy_controls[k][i].ux - control_sequence[i].ux) * dt_sqrt;
-                double noise_uy = (noisy_controls[k][i].uy - control_sequence[i].uy) * dt_sqrt;
-                double noise_uz = (noisy_controls[k][i].uz - control_sequence[i].uz) * dt_sqrt;
-
-                // Accumulate the weighted control adjustments
-                ux_sum += cost_weights[k] * noise_ux;
-                uy_sum += cost_weights[k] * noise_uy;
-                uz_sum += cost_weights[k] * noise_uz;
+                cost_weights[k] = std::exp(min_weight - cost_weights[k]);
             }
 
-            // Normalize and apply H_inv_G
-            if (weight_sum != 0.0) {
-                control_update[i].ux = MPPI::H_inv_G * (ux_sum / weight_sum);
-                control_update[i].uy = MPPI::H_inv_G * (uy_sum / weight_sum);
-                control_update[i].uz = MPPI::H_inv_G * (uz_sum / weight_sum);
+            // Normalize the cost weights for stability
+            double weight_sum = std::accumulate(cost_weights.begin(), cost_weights.end(), 0.0);
+            for (int k = 0; k < MPPI::K; ++k) {
+                cost_weights[k] /= weight_sum;
             }
-            else {
-                control_update[i].ux = 0.0;
-                control_update[i].uy = 0.0;
-                control_update[i].uz = 0.0;
+
+            // Calculate weighted control update for each time step
+            for (int i = 0; i < MPPI::N; ++i) {
+                double ux_sum = 0.0;
+                double uy_sum = 0.0;
+                double uz_sum = 0.0;
+
+                for (int k = 0; k < MPPI::K; ++k) {
+                    // Scale the noise by the time step and temperature
+                    double noise_ux = (noisy_controls[k][i].ux - control_sequence[i].ux) * dt_sqrt;
+                    double noise_uy = (noisy_controls[k][i].uy - control_sequence[i].uy) * dt_sqrt;
+                    double noise_uz = (noisy_controls[k][i].uz - control_sequence[i].uz) * dt_sqrt;
+
+                    // Accumulate the weighted control adjustments
+                    ux_sum += cost_weights[k] * noise_ux;
+                    uy_sum += cost_weights[k] * noise_uy;
+                    uz_sum += cost_weights[k] * noise_uz;
+                }
+
+                // Normalize and apply H_inv_G
+                if (weight_sum != 0.0) {
+                    control_update[i].ux = MPPI::H_inv_G * (ux_sum / weight_sum);
+                    control_update[i].uy = MPPI::H_inv_G * (uy_sum / weight_sum);
+                    control_update[i].uz = MPPI::H_inv_G * (uz_sum / weight_sum);
+                }
+                else {
+                    control_update[i].ux = 0.0;
+                    control_update[i].uy = 0.0;
+                    control_update[i].uz = 0.0;
+                }
             }
+
+            // Update control sequence incrementally
+            selected_position[0].point.x = states.pose.pose.position.x;
+            selected_position[0].point.y = states.pose.pose.position.y;
+            selected_position[0].point.z = states.pose.pose.position.z;
+
+            for (int i = 0; i < MPPI::N; ++i) {
+                control_sequence[i].ux += control_update[i].ux;
+                control_sequence[i].uy += control_update[i].uy;
+                control_sequence[i].uz += control_update[i].uz;
+
+                if (i > 0) {
+                    selected_position[i].point.x = selected_position[i-1].point.x + (control_sequence[i-1].ux * MPPI::dt);
+                    selected_position[i].point.y = selected_position[i-1].point.y + (control_sequence[i-1].uy * MPPI::dt);
+                    selected_position[i].point.z = selected_position[i-1].point.z + (control_sequence[i-1].uz * MPPI::dt);
+                }
+            }
+
+            sampled_position_publish();
+            selected_position_publish();
         }
 
-        // Update control sequence incrementally
-        selected_position[0].point.x = states.pose.pose.position.x;
-        selected_position[0].point.y = states.pose.pose.position.y;
-        selected_position[0].point.z = states.pose.pose.position.z;
+        void sampled_position_publish() {
+            visualization_msgs::Marker line_strip;
+            line_strip.header.frame_id = "map";  // Set the appropriate frame
+            line_strip.header.stamp = ros::Time::now();
+            line_strip.ns = "trajectory";
+            line_strip.id = 0;
+            line_strip.type = visualization_msgs::Marker::LINE_STRIP;
+            line_strip.action = visualization_msgs::Marker::ADD;
+            line_strip.scale.x = 0.05;  // Line width
+            line_strip.color.r = 0.0;
+            line_strip.color.g = 1.0;
+            line_strip.color.b = 0.0;
+            line_strip.color.a = 0.1;  // Fully opaque
 
-        for (int i = 0; i < MPPI::N; ++i) {
-            control_sequence[i].ux += control_update[i].ux;
-            control_sequence[i].uy += control_update[i].uy;
-            control_sequence[i].uz += control_update[i].uz;
-
-            if (i > 0) {
-                selected_position[i].point.x = selected_position[i-1].point.x + (control_sequence[i-1].ux * MPPI::dt);
-                selected_position[i].point.y = selected_position[i-1].point.y + (control_sequence[i-1].uy * MPPI::dt);
-                selected_position[i].point.z = selected_position[i-1].point.z + (control_sequence[i-1].uz * MPPI::dt);
+            // Add all sampled points to the line_strip marker
+            for (int k = 0; k < MPPI::K; ++k) {
+                for (int i = 0; i < MPPI::N; ++i) {
+                    geometry_msgs::Point p;
+                    p.x = sampled_position[k][i].point.x;
+                    p.y = sampled_position[k][i].point.y;
+                    p.z = sampled_position[k][i].point.z;
+                    line_strip.points.push_back(p);
+                }
             }
+
+            // Publish the line strip marker
+            trajectory_marker_pub.publish(line_strip);
         }
 
-        sampled_position_publish();
-        selected_position_publish();
-    }
+        void selected_position_publish() {
+            visualization_msgs::Marker line_strip;
+            line_strip.header.frame_id = "map";  // Set the appropriate frame
+            line_strip.header.stamp = ros::Time::now();
+            line_strip.ns = "selected";
+            line_strip.id = 0;
+            line_strip.type = visualization_msgs::Marker::LINE_STRIP;
+            line_strip.action = visualization_msgs::Marker::ADD;
+            line_strip.scale.x = 0.20;  // Line width
+            line_strip.color.r = 1.0;
+            line_strip.color.g = 0.0;
+            line_strip.color.b = 0.0;
+            line_strip.color.a = 1.0;  // Fully opaque
 
-    void sampled_position_publish() {
-        visualization_msgs::Marker line_strip;
-        line_strip.header.frame_id = "map";  // Set the appropriate frame
-        line_strip.header.stamp = ros::Time::now();
-        line_strip.ns = "trajectory";
-        line_strip.id = 0;
-        line_strip.type = visualization_msgs::Marker::LINE_STRIP;
-        line_strip.action = visualization_msgs::Marker::ADD;
-        line_strip.scale.x = 0.05;  // Line width
-        line_strip.color.r = 0.0;
-        line_strip.color.g = 1.0;
-        line_strip.color.b = 0.0;
-        line_strip.color.a = 0.1;  // Fully opaque
-
-        // Add all sampled points to the line_strip marker
-        for (int k = 0; k < MPPI::K; ++k) {
+            // Add all sampled points to the line_strip marker
             for (int i = 0; i < MPPI::N; ++i) {
                 geometry_msgs::Point p;
-                p.x = sampled_position[k][i].point.x;
-                p.y = sampled_position[k][i].point.y;
-                p.z = sampled_position[k][i].point.z;
+                p.x = selected_position[i].point.x;
+                p.y = selected_position[i].point.y;
+                p.z = selected_position[i].point.z;
                 line_strip.points.push_back(p);
             }
+
+            // Publish the line strip marker
+            selected_marker_pub.publish(line_strip);
         }
 
-        // Publish the line strip marker
-        trajectory_marker_pub.publish(line_strip);
-    }
 
-    void selected_position_publish() {
-        visualization_msgs::Marker line_strip;
-        line_strip.header.frame_id = "map";  // Set the appropriate frame
-        line_strip.header.stamp = ros::Time::now();
-        line_strip.ns = "selected";
-        line_strip.id = 0;
-        line_strip.type = visualization_msgs::Marker::LINE_STRIP;
-        line_strip.action = visualization_msgs::Marker::ADD;
-        line_strip.scale.x = 0.20;  // Line width
-        line_strip.color.r = 1.0;
-        line_strip.color.g = 0.0;
-        line_strip.color.b = 0.0;
-        line_strip.color.a = 1.0;  // Fully opaque
+    private:
+        ros::NodeHandle nh;
 
-        // Add all sampled points to the line_strip marker
-        for (int i = 0; i < MPPI::N; ++i) {
-            geometry_msgs::Point p;
-            p.x = selected_position[i].point.x;
-            p.y = selected_position[i].point.y;
-            p.z = selected_position[i].point.z;
-            line_strip.points.push_back(p);
-        }
+        geometry_msgs::PoseStamped start_point;
+        geometry_msgs::PoseStamped goal_point;
 
-        // Publish the line strip marker
-        selected_marker_pub.publish(line_strip);
-    }
+        // Random noise generator
+        std::default_random_engine noise_generator;
+        std::normal_distribution<double> noise_distribution{0.0, MPPI::control_noise};
 
+        // Visualization of computed positions
+        std::vector<std::vector<geometry_msgs::PointStamped>> sampled_position;
+        std::vector<geometry_msgs::PointStamped> selected_position;
 
-private:
-    ros::NodeHandle nh;
-
-    geometry_msgs::PoseStamped start_point;
-    geometry_msgs::PoseStamped goal_point;
-
-    // Random noise generator
-    std::default_random_engine noise_generator;
-    std::normal_distribution<double> noise_distribution{0.0, MPPI::control_noise};
-
-    // Visualization of computed positions
-    std::vector<std::vector<geometry_msgs::PointStamped>> sampled_position;
-    std::vector<geometry_msgs::PointStamped> selected_position;
-
-    ros::Publisher trajectory_marker_pub;
-    ros::Publisher selected_marker_pub;
+        ros::Publisher trajectory_marker_pub;
+        ros::Publisher selected_marker_pub;
 };
 
 class QuadStatesScriber {
-public:
-    QuadStatesScriber(ros::NodeHandle nh) : nh(nh), data_received(false) {
-        quad_states_sub = nh.subscribe("/mavros/global_position/local", 10, &QuadStatesScriber::quadStateCallback, this);
-        ROS_INFO("[MPPI] Quadrotor state scriber has been successfully created!");
-    }
+    public:
+        QuadStatesScriber(ros::NodeHandle nh) : nh(nh), data_received(false) {
+            quad_states_sub = nh.subscribe("/mavros/global_position/local", 10, &QuadStatesScriber::quadStateCallback, this);
+            ROS_INFO("[MPPI] Quadrotor state scriber has been successfully created!");
+        }
 
-    void quadStateCallback(const nav_msgs::Odometry& msg) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        quad_states = msg;
-        data_received = true;  // Indicate that data has been received
-    }
+        void quadStateCallback(const nav_msgs::Odometry& msg) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            quad_states = msg;
+            data_received = true;  // Indicate that data has been received
+        }
 
-    nav_msgs::Odometry getQuadStates() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return quad_states;
-    }
+        nav_msgs::Odometry getQuadStates() {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return quad_states;
+        }
 
-    bool isDataAvailable() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return data_received;
-    }
+        bool isDataAvailable() {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return data_received;
+        }
 
-private:
-    ros::NodeHandle nh;
-    ros::Subscriber quad_states_sub;
-    nav_msgs::Odometry quad_states;
-    std::mutex mutex_;
-    bool data_received;
+    private:
+        ros::NodeHandle nh;
+        ros::Subscriber quad_states_sub;
+        nav_msgs::Odometry quad_states;
+        std::mutex mutex_;
+        bool data_received;
 };
 
 
@@ -620,24 +749,24 @@ int main(int argc, char** argv) {
     QuadStatesScriber quad_states_subscriber(nh);
 
     // Wait for quadrotor state data to be available
-    ros::Rate rate(10);  // 10 Hz
+    ros::Rate rate(50);  // 10 Hz
     while (ros::ok() && !quad_states_subscriber.isDataAvailable()) {
         ros::spinOnce();  // Process incoming messages
         rate.sleep();
     }
     ROS_INFO("[MPPI] Quadrotor data is available!");
 
-    SensorDataManager depth_camera_manager(nh, quad_states_subscriber);
+    // SensorDataManager depth_camera_manager(nh, quad_states_subscriber);
     MPPIController mppi_controller(nh, start_point, goal_point);
     ControlPublisher control_publisher(nh);
 
-    pcl::PointCloud<pcl::PointXYZ>::Ptr current_point_cloud = depth_camera_manager.getPointClouds();
-    while (ros::ok() && !depth_camera_manager.isDataAvailable()) {
-        ros::spinOnce();
-        rate.sleep();
-    }
-    depth_camera_manager.clearDataAvailable();
-    ROS_INFO("[MPPI] Point cloud data is available!");
+    // pcl::PointCloud<pcl::PointXYZ>::Ptr current_point_cloud = depth_camera_manager.getPointClouds();
+    // while (ros::ok() && !depth_camera_manager.isDataAvailable()) {
+    //     ros::spinOnce();
+    //     rate.sleep();
+    // }
+    // depth_camera_manager.clearDataAvailable();
+    // ROS_INFO("[MPPI] Point cloud data is available!");
 
     // Initial state and control sequence
     nav_msgs::Odometry quad_current_states = quad_states_subscriber.getQuadStates();
@@ -648,17 +777,26 @@ int main(int argc, char** argv) {
 
     std::vector<Control3D> control_sequence(MPPI::N, {0.0, 0.0, 0.2});
 
+    // time measure
+    auto start = std::chrono::high_resolution_clock::now();
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+
     while (ros::ok()) {
+        
+        // time measure
+        start = std::chrono::high_resolution_clock::now();
+
         // current states receive
         quad_current_states = quad_states_subscriber.getQuadStates();
 
         // Get point clouds for obstacles
-        if (depth_camera_manager.isDataAvailable()) {
-            depth_camera_manager.clearDataAvailable();
-        }
+        // if (depth_camera_manager.isDataAvailable()) {
+        //     depth_camera_manager.clearDataAvailable();
+        // }
 
         // Perform MPPI optimization
-        mppi_controller.mppi_optimization(quad_current_states, control_sequence, current_point_cloud);
+        mppi_controller.mppi_optimization(quad_current_states, control_sequence);
 
         // Publish the first control in the sequence
         geometry_msgs::Twist cmd;
@@ -666,13 +804,17 @@ int main(int argc, char** argv) {
         cmd.linear.y = control_sequence[0].uy;
         cmd.linear.z = control_sequence[0].uz;
         control_publisher.controlPublish(cmd);
-        ROS_INFO("%f, %f, %f", control_sequence[0].ux, control_sequence[0].uy, control_sequence[0].uz);
+        // ROS_INFO("%f, %f, %f", control_sequence[0].ux, control_sequence[0].uy, control_sequence[0].uz);
 
 
         // Shift the control sequence and reinitialize the last one
         for (int i = 0; i < MPPI::N - 1; ++i) {
             control_sequence[i] = control_sequence[i + 1];
         }
+
+        end = std::chrono::high_resolution_clock::now();
+        elapsed = end - start;
+        std::cout << "MPPI Optimization Time: " << elapsed.count() << " seconds" << std::endl;
 
         ros::spinOnce();
         rate.sleep();

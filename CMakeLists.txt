@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.0.2)
-project(quad_mppi)
+project(quad_mppi LANGUAGES CXX CUDA)
 
 ## Compile as C++11, supported in ROS Kinetic and newer
-# add_compile_options(-std=c++11 -O3)
+add_compile_options(-std=c++14 -O3)
 
 ## Find catkin macros and libraries
 ## if COMPONENTS list like find_package(catkin REQUIRED COMPONENTS xyz)
@@ -24,6 +24,15 @@ find_package(PCL REQUIRED)
 find_package(octomap REQUIRED)
 find_package(octomap_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
+
+## Add CUDA support
+find_package(CUDA REQUIRED)
+set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS} -std=c++14 --generate-line-info -arch=sm_75")
+set(CMAKE_CUDA_COMPILER /usr/local/cuda-12.2/bin/nvcc)
+## Specify CUDA source files
+set(CUDA_SOURCES
+  src/noise_generator_cuda.cu
+)
 
 ## System dependencies are found with CMake's conventions
 # find_package(Boost REQUIRED COMPONENTS system)
@@ -128,14 +137,21 @@ catkin_package(
 ## Specify additional locations of header files
 ## Your package locations should be listed before other locations
 include_directories(
-# include
+  include
   ${catkin_INCLUDE_DIRS}
   ${PCL_INCLUDE_DIRS}
   ${OCTOMAP_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIRS}
+  ${CUDA_INCLUDE_DIRS}
 )
 
+## Add CUDA-related library or executable
+add_library(noise_generator_cuda STATIC ${CUDA_SOURCES})
+set_target_properties(noise_generator_cuda PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_link_libraries(noise_generator_cuda ${CUDA_LIBRARIES})
+
 add_executable(quad_mppi_node src/quad_mppi_node.cpp)
+add_dependencies(quad_mppi_node noise_generator_cuda)
 target_link_libraries(quad_mppi_node
   ${catkin_LIBRARIES}
   ${PCL_LIBRARIES}
@@ -143,6 +159,7 @@ target_link_libraries(quad_mppi_node
   octomap
   octomath
   Eigen3::Eigen
+  noise_generator_cuda
 )
 
 add_executable(my_quad_node src/my_quad_node.cpp)
